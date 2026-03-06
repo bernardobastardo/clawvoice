@@ -155,27 +155,6 @@ class OpenClawConversationEntity(ConversationEntity):
         conversation.async_unset_agent(self.hass, self.entry)
         await super().async_will_remove_from_hass()
 
-    def _build_messages(self, chat_log: ChatLog) -> list[dict]:
-        """Build OpenAI-compatible messages from the HA chat log."""
-        messages: list[dict] = []
-
-        # Add system prompt if configured
-        prompt = self.entry.options.get(CONF_PROMPT)
-        if prompt:
-            messages.append({"role": "system", "content": prompt})
-
-        # Replay conversation history for multi-turn continuity
-        for content in chat_log.content:
-            if isinstance(content, conversation.UserContent):
-                messages.append({"role": "user", "content": content.content})
-            elif isinstance(content, conversation.AssistantContent):
-                if content.content:
-                    messages.append({"role": "assistant", "content": content.content})
-            elif isinstance(content, conversation.SystemContent):
-                messages.append({"role": "system", "content": content.content})
-
-        return messages
-
     async def _async_handle_message(
         self,
         user_input: ConversationInput,
@@ -184,29 +163,43 @@ class OpenClawConversationEntity(ConversationEntity):
         """Process the user input and call the OpenClaw API with streaming."""
         session = async_get_clientsession(self.hass)
 
-        # Send the full chat log so OpenClaw has conversation context.
-        # We cannot use OpenClaw session keys because the `user` / session-key
-        # binding ignores the agent_id header and always routes to the default
-        # agent. Instead, we maintain continuity by replaying the history.
-        messages = self._build_messages(chat_log)
-
+        # Only send the latest user message. OpenClaw maintains conversation
+        # context via native sessions, linked by the `user` field in the payload.
+        # IMPORTANT: do NOT send the x-openclaw-session-key header — it breaks
+        # agent routing for non-default agents. The `user` field alone is enough
+        # for OpenClaw to derive a stable session key.
         agent_id = self._agent_id
+        messages: list[dict] = []
+
+        prompt = self.entry.options.get(CONF_PROMPT)
+        if prompt:
+            messages.append({"role": "system", "content": prompt})
+
+        messages.append({"role": "user", "content": user_input.text})
+
+        # Use conversation_id as the user field for session continuity.
+        # Prefix with agent_id so different agents don't share sessions.
+        conversation_id = user_input.conversation_id
+        user_key = f"ha:{agent_id}:{conversation_id}" if conversation_id else None
 
         payload: dict = {
             "model": f"openclaw:{agent_id}",
             "messages": messages,
             "stream": True,
         }
+        if user_key:
+            payload["user"] = user_key
 
         headers = self._headers.copy()
 
         url = f"{self._base_url}/v1/chat/completions"
 
         LOGGER.debug(
-            "Sending to OpenClaw: url=%s agent_id=%s model=%s",
+            "Sending to OpenClaw: url=%s agent_id=%s model=%s user=%s",
             url,
             headers.get("x-openclaw-agent-id"),
             payload["model"],
+            user_key,
         )
 
         # Open the HTTP connection and validate status BEFORE entering
