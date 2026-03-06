@@ -112,8 +112,12 @@ class OpenClawConversationEntity(ConversationEntity):
             model="Gateway",
             entry_type=dr.DeviceEntryType.SERVICE,
         )
-        # Pre-compute immutable headers once (token + agent don't change at runtime)
-        self._cached_headers: dict[str, str] | None = None
+        # Cache auth headers (token doesn't change). Agent ID is added per-request
+        # since it can be changed via options flow without reload.
+        self._auth_headers: dict[str, str] = {"Content-Type": "application/json"}
+        token = entry.data.get(CONF_API_TOKEN)
+        if token:
+            self._auth_headers["Authorization"] = f"Bearer {token}"
 
     @property
     def supported_languages(self) -> list[str] | Literal["*"]:
@@ -135,17 +139,11 @@ class OpenClawConversationEntity(ConversationEntity):
 
     @property
     def _headers(self) -> dict[str, str]:
-        """Return cached HTTP headers for the OpenClaw API."""
-        if self._cached_headers is None:
-            headers: dict[str, str] = {
-                "Content-Type": "application/json",
-                "x-openclaw-agent-id": self._agent_id,
-            }
-            token = self.entry.data.get(CONF_API_TOKEN)
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-            self._cached_headers = headers
-        return self._cached_headers
+        """Return HTTP headers with the current agent ID."""
+        return {
+            **self._auth_headers,
+            "x-openclaw-agent-id": self._agent_id,
+        }
 
     async def async_added_to_hass(self) -> None:
         """When entity is added to Home Assistant."""
@@ -192,6 +190,14 @@ class OpenClawConversationEntity(ConversationEntity):
             headers["x-openclaw-session-key"] = user_key
 
         url = f"{self._base_url}/v1/chat/completions"
+
+        LOGGER.debug(
+            "Sending to OpenClaw: url=%s agent_id=%s model=%s session=%s",
+            url,
+            headers.get("x-openclaw-agent-id"),
+            payload["model"],
+            user_key,
+        )
 
         # Open the HTTP connection and validate status BEFORE entering
         # the streaming generator. This separates connection errors from
