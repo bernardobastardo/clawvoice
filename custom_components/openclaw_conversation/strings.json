@@ -1,0 +1,43 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to OpenClaw Gateway",
+        "description": "Enter the connection details for your OpenClaw gateway instance.",
+        "data": {
+          "base_url": "Gateway URL",
+          "api_token": "API Token (optional)",
+          "agent_id": "Agent ID"
+        },
+        "data_description": {
+          "base_url": "The full URL of your OpenClaw gateway (e.g. http://192.168.1.100:18789)",
+          "api_token": "Bearer token for authentication. Leave empty if no auth is configured.",
+          "agent_id": "The OpenClaw agent to use (default: main)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the OpenClaw gateway. Check the URL and make sure the gateway is running with chatCompletions endpoint enabled.",
+      "invalid_auth": "Invalid authentication. Check your API token.",
+      "unknown": "Unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "This OpenClaw gateway is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "OpenClaw Options",
+        "data": {
+          "prompt": "System Prompt (optional)",
+          "agent_id": "Agent ID"
+        },
+        "data_description": {
+          "prompt": "Custom system prompt to prepend to every conversation. Leave empty to use OpenClaw's default.",
+          "agent_id": "The OpenClaw agent to use"
+        }
+      }
+    }
+  }
+}
