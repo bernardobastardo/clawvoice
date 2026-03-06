@@ -47,79 +47,51 @@ async def async_setup_entry(
 
 
 async def _transform_stream(
-    chat_log: ChatLog,
-    session: aiohttp.ClientSession,
-    url: str,
-    payload: dict,
-    headers: dict[str, str],
+    resp: aiohttp.ClientResponse,
 ) -> AsyncGenerator[conversation.AssistantContentDeltaDict]:
-    """Stream OpenClaw SSE response and yield HA delta dicts.
+    """Parse SSE from an already-open response and yield HA delta dicts.
 
-    Yields:
-        AssistantContentDeltaDict: role and content deltas that HA's
-        async_add_delta_content_stream understands.
+    The HTTP connection is already established before this generator starts,
+    so we only pay the parsing cost here — zero network setup overhead.
     """
     # First delta must declare the role
     yield {"role": "assistant"}
 
-    try:
-        async with session.post(
-            url,
-            json=payload,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=120, sock_read=60),
-        ) as resp:
-            if resp.status == 401:
-                raise HomeAssistantError("Authentication failed with OpenClaw")
-            if resp.status == 429:
-                raise HomeAssistantError("Rate limited by OpenClaw")
-            if resp.status >= 400:
-                text = await resp.text()
-                LOGGER.error("OpenClaw error %s: %s", resp.status, text)
-                raise HomeAssistantError(f"OpenClaw returned error {resp.status}")
+    # Read raw bytes and parse SSE inline — avoids buffering full lines
+    buffer = ""
+    async for chunk in resp.content.iter_any():
+        buffer += chunk.decode("utf-8")
 
-            # Parse SSE stream line by line
-            buffer = ""
-            async for raw_bytes in resp.content:
-                buffer += raw_bytes.decode("utf-8")
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            line = line.strip()
 
-                # SSE events are separated by double newlines
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
+            if not line or not line.startswith("data:"):
+                continue
 
-                    if not line or not line.startswith("data:"):
-                        continue
+            data_str = line[5:].strip()
 
-                    data_str = line[5:].strip()
+            if data_str == "[DONE]":
+                return
 
-                    if data_str == "[DONE]":
-                        return
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
 
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        LOGGER.debug("Skipping non-JSON SSE line: %s", data_str)
-                        continue
+            choices = data.get("choices")
+            if not choices:
+                continue
 
-                    # Extract delta content from the chat completions chunk
-                    choices = data.get("choices", [])
-                    if not choices:
-                        continue
+            choice = choices[0]
+            delta = choice.get("delta")
+            if delta:
+                content = delta.get("content")
+                if content:
+                    yield {"content": content}
 
-                    delta = choices[0].get("delta", {})
-                    content = delta.get("content")
-                    if content:
-                        yield {"content": content}
-
-                    # Check for finish_reason
-                    finish_reason = choices[0].get("finish_reason")
-                    if finish_reason == "stop":
-                        return
-
-    except aiohttp.ClientError as err:
-        LOGGER.error("Connection error to OpenClaw: %s", err)
-        raise HomeAssistantError(f"Connection error to OpenClaw: {err}") from err
+            if choice.get("finish_reason") == "stop":
+                return
 
 
 class OpenClawConversationEntity(ConversationEntity):
@@ -140,6 +112,8 @@ class OpenClawConversationEntity(ConversationEntity):
             model="Gateway",
             entry_type=dr.DeviceEntryType.SERVICE,
         )
+        # Pre-compute immutable headers once (token + agent don't change at runtime)
+        self._cached_headers: dict[str, str] | None = None
 
     @property
     def supported_languages(self) -> list[str] | Literal["*"]:
@@ -161,15 +135,17 @@ class OpenClawConversationEntity(ConversationEntity):
 
     @property
     def _headers(self) -> dict[str, str]:
-        """Return the HTTP headers for the OpenClaw API."""
-        headers: dict[str, str] = {
-            "Content-Type": "application/json",
-            "x-openclaw-agent-id": self._agent_id,
-        }
-        token = self.entry.data.get(CONF_API_TOKEN)
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        return headers
+        """Return cached HTTP headers for the OpenClaw API."""
+        if self._cached_headers is None:
+            headers: dict[str, str] = {
+                "Content-Type": "application/json",
+                "x-openclaw-agent-id": self._agent_id,
+            }
+            token = self.entry.data.get(CONF_API_TOKEN)
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            self._cached_headers = headers
+        return self._cached_headers
 
     async def async_added_to_hass(self) -> None:
         """When entity is added to Home Assistant."""
@@ -181,30 +157,6 @@ class OpenClawConversationEntity(ConversationEntity):
         conversation.async_unset_agent(self.hass, self.entry)
         await super().async_will_remove_from_hass()
 
-    def _build_messages(
-        self,
-        chat_log: ChatLog,
-    ) -> list[dict]:
-        """Build the messages payload from the chat log."""
-        messages: list[dict] = []
-
-        # Add system prompt if configured
-        prompt = self.entry.options.get(CONF_PROMPT)
-        if prompt:
-            messages.append({"role": "system", "content": prompt})
-
-        # Convert chat log content to OpenAI-compatible messages
-        for content in chat_log.content:
-            if isinstance(content, conversation.UserContent):
-                messages.append({"role": "user", "content": content.content})
-            elif isinstance(content, conversation.AssistantContent):
-                if content.content:
-                    messages.append({"role": "assistant", "content": content.content})
-            elif isinstance(content, conversation.SystemContent):
-                messages.append({"role": "system", "content": content.content})
-
-        return messages
-
     async def _async_handle_message(
         self,
         user_input: ConversationInput,
@@ -212,10 +164,19 @@ class OpenClawConversationEntity(ConversationEntity):
     ) -> ConversationResult:
         """Process the user input and call the OpenClaw API with streaming."""
         session = async_get_clientsession(self.hass)
-        messages = self._build_messages(chat_log)
 
-        # Use conversation_id as session key for OpenClaw
-        # This allows OpenClaw to maintain its own conversation context
+        # Only send the latest user message — OpenClaw has its own memory
+        # and session management. Sending the full chat log is redundant
+        # and adds unnecessary latency (bigger payload, more processing).
+        messages: list[dict] = []
+
+        prompt = self.entry.options.get(CONF_PROMPT)
+        if prompt:
+            messages.append({"role": "system", "content": prompt})
+
+        messages.append({"role": "user", "content": user_input.text})
+
+        # Session key ties this HA conversation to an OpenClaw session
         user_key = user_input.conversation_id or None
 
         payload: dict = {
@@ -232,20 +193,40 @@ class OpenClawConversationEntity(ConversationEntity):
 
         url = f"{self._base_url}/v1/chat/completions"
 
-        # Use HA's delta streaming API - this is what makes the voice pipeline
-        # send audio chunks to the satellite progressively as text arrives.
-        # Each delta is forwarded to TTS which converts text->audio in chunks.
+        # Open the HTTP connection and validate status BEFORE entering
+        # the streaming generator. This separates connection errors from
+        # parsing and lets us fail fast on auth/server issues.
         try:
-            delta_stream = _transform_stream(chat_log, session, url, payload, headers)
+            resp = await session.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(
+                    total=120,
+                    sock_connect=5,  # fail fast if gateway unreachable
+                    sock_read=60,
+                ),
+            )
+        except aiohttp.ClientError as err:
+            LOGGER.error("Connection error to OpenClaw: %s", err)
+            raise HomeAssistantError(f"Connection error to OpenClaw: {err}") from err
 
-            # async_add_delta_content_stream consumes the generator,
-            # builds up the AssistantContent, and returns the collected
-            # content objects. HA internally forwards each delta to TTS
-            # for streaming audio generation.
+        try:
+            if resp.status == 401:
+                raise HomeAssistantError("Authentication failed with OpenClaw")
+            if resp.status == 429:
+                raise HomeAssistantError("Rate limited by OpenClaw")
+            if resp.status >= 400:
+                text = await resp.text()
+                LOGGER.error("OpenClaw error %s: %s", resp.status, text)
+                raise HomeAssistantError(f"OpenClaw returned error {resp.status}")
+
+            # Stream deltas into HA's pipeline — this is what makes TTS
+            # generate audio progressively as text arrives from OpenClaw.
             async for _content in chat_log.async_add_delta_content_stream(
-                user_input.agent_id, delta_stream
+                user_input.agent_id, _transform_stream(resp)
             ):
-                pass  # HA handles the streaming internally
+                pass
 
         except HomeAssistantError:
             raise
@@ -254,5 +235,7 @@ class OpenClawConversationEntity(ConversationEntity):
             raise HomeAssistantError(
                 f"Error communicating with OpenClaw: {err}"
             ) from err
+        finally:
+            resp.release()
 
         return conversation.async_get_result_from_chat_log(user_input, chat_log)
