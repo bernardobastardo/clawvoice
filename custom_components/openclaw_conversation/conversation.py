@@ -174,29 +174,28 @@ class OpenClawConversationEntity(ConversationEntity):
 
         messages.append({"role": "user", "content": user_input.text})
 
-        # Session key ties this HA conversation to an OpenClaw session
-        user_key = user_input.conversation_id or None
+        # Do NOT send session keys or user field. OpenClaw's session binding
+        # resolves existing sessions by key and ignores the agent_id — so a
+        # key that was previously bound to agent "main" would hijack requests
+        # meant for "flash". Each request is stateless from the HTTP side;
+        # OpenClaw manages its own memory/context per agent internally.
+        agent_id = self._agent_id
 
         payload: dict = {
-            "model": f"openclaw:{self._agent_id}",
+            "model": f"openclaw:{agent_id}",
             "messages": messages,
             "stream": True,
         }
-        if user_key:
-            payload["user"] = user_key
 
         headers = self._headers.copy()
-        if user_key:
-            headers["x-openclaw-session-key"] = user_key
 
         url = f"{self._base_url}/v1/chat/completions"
 
         LOGGER.debug(
-            "Sending to OpenClaw: url=%s agent_id=%s model=%s session=%s",
+            "Sending to OpenClaw: url=%s agent_id=%s model=%s",
             url,
             headers.get("x-openclaw-agent-id"),
             payload["model"],
-            user_key,
         )
 
         # Open the HTTP connection and validate status BEFORE entering
